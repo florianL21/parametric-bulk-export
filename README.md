@@ -1,11 +1,6 @@
 # parametric-bulk-export
-A Fusion 360 add-in for exporting meshes in batches whilst changing selected user parameters.  
+
+> This is a fork of the original implementation using CSV files instead of a UI
+
+A Fusion 360 add-in for exporting meshes in batches whilst changing selected user parameters via the use of a CSV file
 > NOTE: It only exports the active component.
-
-![preview](preview.png)
-
-# Todo
-- checkboxes per row to toggle whether a parameters export variations apply
-- button to clear all variations
-- button to clear variations per parameter
-- checkboxes to toggle a variation
