@@ -1,3 +1,4 @@
+from __future__ import annotations
 from .lib import fusion360utils as futil
 import adsk.core
 import adsk.fusion
@@ -5,10 +6,10 @@ import traceback
 import csv
 from pathlib import Path
 
-COMMAND_NAME = "Parametric Export"
-COMMAND_DESCRIPTION = "Bulk export meshes, changing selected parameters."
-COMMAND_RESOURCES = ""
-COMMAND_ID = "parametric-bulk-export"
+BULK_EXPORT_COMMAND_NAME = "Parametric Export"
+BULK_EXPORT_COMMAND_DESCRIPTION = "Bulk export meshes, changing selected parameters."
+BULK_EXPORT_COMMAND_ID = "parametric-bulk-export"
+VARIANT_EXPORT_COMMAND_ID = "exportSingleVariant"
 TARGET_WORKSPACE = "FusionSolidEnvironment"
 TARGET_PANEL = "SolidScriptsAddinsPanel"
 
@@ -18,63 +19,75 @@ CSV_SPECIAL_HEADERS = [CSV_EXPORT_NAME, CSV_EXPORT_FLAG]
 _handlers: "list[adsk.core.EventHandler]" = []
 
 
-class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
+class BulkExportCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
     def __init__(self):
         super().__init__()
         self.app = adsk.core.Application.get()
         self.ui = self.app.userInterface
-        self.design: adsk.fusion.Design = self.app.activeProduct  # type: ignore
-        self.export_variations_count = 10
-        self.total_columns = 2 + self.export_variations_count
 
     def notify(self, eventArgs: adsk.core.CommandCreatedEventArgs):
         try:
-            self._notify(eventArgs)
+            cmd = eventArgs.command
+            on_execute = BulkExportCommandExecuteHandler()
+            cmd.execute.add(on_execute)
+            _handlers.append(on_execute)
+            inputs = cmd.commandInputs
+
+            export_file_types_group = inputs.addGroupCommandInput(
+                "exportFileTypes", "File Types"
+            )
+            export_file_types_group.children.addBoolValueInput(
+                "exportStlMeshBool", "STL", True
+            )
+            export_file_types_group.children.addBoolValueInput(
+                "exportStepMeshBool", "Step", True
+            )
+            export_file_types_group.children.addBoolValueInput(
+                "exportObjMeshBool", "Obj", True
+            )
+            export_file_types_group.children.addBoolValueInput(
+                "export3mfMeshBool", "3MF", True
+            )
+
+            export_input_options_group = inputs.addGroupCommandInput(
+                "exportImportFile", "Export/import"
+            )
+
+            radioButtonGroup = (
+                export_input_options_group.children.addRadioButtonGroupCommandInput(
+                    "radioImportExport", " Import or Export "
+                )
+            )
+            radioButtonGroup.isFullWidth = True
+            radioButtonItems = radioButtonGroup.listItems
+            radioButtonItems.add("Load CSV", True)
+            radioButtonItems.add("Save starting point CSV", False)
         except Exception:
             if self.ui:
                 self.ui.messageBox(
                     f"Panel command created failed:\n{traceback.format_exc()}"
                 )
 
-    def _notify(self, args: adsk.core.CommandCreatedEventArgs):
-        cmd = args.command
-        on_execute = CommandExecuteHandler()
-        cmd.execute.add(on_execute)
-        _handlers.append(on_execute)
-        inputs = cmd.commandInputs
 
-        export_file_types_group = inputs.addGroupCommandInput(
-            "exportFileTypes", "File Types"
-        )
-        export_file_types_group.children.addBoolValueInput(
-            "exportStlMeshBool", "STL", True
-        )
-        export_file_types_group.children.addBoolValueInput(
-            "exportStepMeshBool", "Step", True
-        )
-        export_file_types_group.children.addBoolValueInput(
-            "exportObjMeshBool", "Obj", True
-        )
-        export_file_types_group.children.addBoolValueInput(
-            "export3mfMeshBool", "3MF", True
-        )
-
-        export_input_options_group = inputs.addGroupCommandInput(
-            "exportImportFile", "Export/import"
-        )
-
-        radioButtonGroup = (
-            export_input_options_group.children.addRadioButtonGroupCommandInput(
-                "radioImportExport", " Import or Export "
-            )
-        )
-        radioButtonGroup.isFullWidth = True
-        radioButtonItems = radioButtonGroup.listItems
-        radioButtonItems.add("Load CSV", True)
-        radioButtonItems.add("Save starting point CSV", False)
+class ExportSettings:
+    def __init__(
+        self,
+        output_folder: str,
+        variation: ParameterList,
+        do_stl: bool,
+        do_step: bool,
+        do_obj: bool,
+        do_3mf: bool,
+    ):
+        self.output_folder = output_folder
+        self.do_stl = do_stl
+        self.do_step = do_step
+        self.do_obj = do_obj
+        self.do_3mf = do_3mf
+        self.variation = variation
 
 
-class CommandExecuteHandler(adsk.core.CommandEventHandler):
+class BulkExportCommandExecuteHandler(adsk.core.CommandEventHandler):
     def __init__(self):
         super().__init__()
         self.app = adsk.core.Application.get()
@@ -82,33 +95,130 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
     def notify(self, eventArgs: adsk.core.CommandEventArgs):
         try:
-            self._notify(eventArgs)
+            inputs = eventArgs.command.commandInputs
+
+            do_stl = bool(inputs.itemById("exportStlMeshBool").value)  # type: ignore
+            do_step = bool(inputs.itemById("exportStepMeshBool").value)  # type: ignore
+            do_obj = bool(inputs.itemById("exportObjMeshBool").value)  # type: ignore
+            do_3mf = bool(inputs.itemById("export3mfMeshBool").value)  # type: ignore
+            radioButtonGroup: adsk.core.RadioButtonGroupCommandInput = inputs.itemById(
+                "radioImportExport"
+            )  # type: ignore
+            is_import = radioButtonGroup.selectedItem.name == "Load CSV"
+            self.do_import_export(is_import, do_stl, do_step, do_obj, do_3mf)
         except Exception:
             if self.ui:
                 self.ui.messageBox(
                     f"command executed failed:\n{traceback.format_exc()}"
                 )
 
-    def _notify(self, args: adsk.core.CommandEventArgs):
-        inputs = args.command.commandInputs
+    def do_import_export(
+        self, isImport: bool, do_stl: bool, do_step: bool, do_obj: bool, do_3mf: bool
+    ):
+        try:
+            fileDialog = self.ui.createFileDialog()
+            fileDialog.isMultiSelectEnabled = False
+            fileDialog.title = (
+                "Get the file to read from or the file to save the parameters to"
+            )
+            fileDialog.filter = "Text files (*.csv)"
+            fileDialog.filterIndex = 0
+            if isImport:
+                dialogResult = fileDialog.showOpen()
+            else:
+                dialogResult = fileDialog.showSave()
 
-        do_stl = bool(inputs.itemById("exportStlMeshBool").value)  # type: ignore
-        do_step = bool(inputs.itemById("exportStepMeshBool").value)  # type: ignore
-        do_obj = bool(inputs.itemById("exportObjMeshBool").value)  # type: ignore
-        do_3mf = bool(inputs.itemById("export3mfMeshBool").value)  # type: ignore
-        radioButtonGroup: adsk.core.RadioButtonGroupCommandInput = inputs.itemById(
-            "radioImportExport"
-        )  # type: ignore
-        is_import = radioButtonGroup.selectedItem.name == "Load CSV"
-        do_import_export(is_import, do_stl, do_step, do_obj, do_3mf)
+            if dialogResult == adsk.core.DialogResults.DialogOK:  # type: ignore
+                filename = fileDialog.filename
+            else:
+                return
+
+            # if isImport is true read the parameters from a file
+            if isImport:
+                self.export(filename, do_stl, do_step, do_obj, do_3mf)
+            else:
+                write_parameters_to_file(filename)
+
+        except:
+            if self.ui:
+                self.ui.messageBox("Failed:\n{}".format(traceback.format_exc()))
+
+    def export(
+        self, filePath: str, do_stl: bool, do_step: bool, do_obj: bool, do_3mf: bool
+    ):
+        design = adsk.fusion.Design.cast(self.app.activeProduct)  # type: ignore
+        output_folder = get_output_folder()
+        if output_folder is None:
+            return
+        variations = read_parameters_from_file(filePath)
+        # TODO: Take a snapshot of the current state of the model
+        for variation in variations:
+            if variation.should_export:
+                # named_vals = adsk.core.NamedValues.create()
+                # export_settings = ExportSettings(
+                #     output_folder=output_folder,
+                #     variation=variation,
+                #     do_stl=do_stl,
+                #     do_step=do_step,
+                #     do_obj=do_obj,
+                #     do_3mf=do_3mf,
+                # )
+                # named_vals.add(
+                #     "export_settings",
+                #     adsk.core.ValueInput.createByString("test string"),
+                # )
+                # self.ui.commandDefinitions.itemById(VARIANT_EXPORT_COMMAND_ID).execute(
+                #     named_vals
+                # )
+                apply_parameters(self.ui, design, variation)
+                export_meshes(
+                    output_folder,
+                    variation.output_filename,
+                    design.activeComponent,
+                    do_stl,
+                    do_step,
+                    do_obj,
+                    do_3mf,
+                )
+                # TODO: Restore the taken model snapshot from above
+        self.ui.messageBox("Export finished successfully")
 
 
-def get_add_in_command_definition(ui: adsk.core.UserInterface):
+class ExportVariantCommandCreatedEventHandler(adsk.core.CommandCreatedEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, eventArgs: adsk.core.CommandCreatedEventArgs):
+        cmd = eventArgs.command
+
+        onExecute = ExportVariantCommandExecuteHandler()
+        cmd.execute.add(onExecute)
+        _handlers.append(onExecute)
+
+
+class ExportVariantCommandExecuteHandler(adsk.core.CommandEventHandler):
+    def __init__(self):
+        super().__init__()
+        self.app = adsk.core.Application.get()
+        self.ui = self.app.userInterface
+
+    def notify(self, eventArgs: adsk.core.CommandEventArgs):
+        test = eventArgs.command.commandInputs
+        test.itemById("export_settings")
+        self.ui.messageBox("Export single variant")
+        # adsk.terminate()
+
+
+def get_add_in_command_definition(
+    ui: adsk.core.UserInterface, id: str, name: str, description: str
+):
     command_definitions = ui.commandDefinitions
-    command_definition = command_definitions.itemById(COMMAND_ID)
+    command_definition = command_definitions.itemById(id)
     if not command_definition:
         command_definition = command_definitions.addButtonDefinition(
-            COMMAND_ID, COMMAND_NAME, COMMAND_DESCRIPTION, COMMAND_RESOURCES
+            id,
+            name,
+            description,
         )
     return command_definition
 
@@ -152,77 +262,9 @@ def destroy_object(
         ui_obj.messageBox("toBeDeleteObj is not a valid object")
 
 
-def run(_):
-    ui = None
-
-    try:
-        app = adsk.core.Application.get()
-        ui = app.userInterface
-        start_add_in(app, ui)
-    except Exception:
-        if ui:
-            ui.messageBox("AddIn Start Failed:\n{}".format(traceback.format_exc()))
-        futil.handle_error("run")
-
-
-def start_add_in(app: adsk.core.Application, ui: adsk.core.UserInterface):
-    command_definition = get_add_in_command_definition(ui)
-    on_command_created = CommandCreatedHandler()
-    command_definition.commandCreated.add(on_command_created)
-    _handlers.append(on_command_created)
-
-    workspaces = ui.workspaces
-    modeling_workspace = workspaces.itemById(TARGET_WORKSPACE)
-    toolbar_panels = modeling_workspace.toolbarPanels
-    toolbar_panel = toolbar_panels.itemById(TARGET_PANEL)
-    toolbar_controls_panel = toolbar_panel.controls
-    toolbar_control_panel = toolbar_controls_panel.itemById(COMMAND_ID)
-    if not toolbar_control_panel:
-        toolbar_control_panel = toolbar_controls_panel.addCommand(
-            command_definition, ""
-        )
-        toolbar_control_panel.isVisible = True
-        futil.log(f"{COMMAND_ID} successfully added to add ins panel")
-
-
-def do_import_export(
-    isImport: bool, do_stl: bool, do_step: bool, do_obj: bool, do_3mf: bool
-):
-    app = adsk.core.Application.get()
-    ui = app.userInterface
-
-    try:
-        fileDialog = ui.createFileDialog()
-        fileDialog.isMultiSelectEnabled = False
-        fileDialog.title = (
-            "Get the file to read from or the file to save the parameters to"
-        )
-        fileDialog.filter = "Text files (*.csv)"
-        fileDialog.filterIndex = 0
-        if isImport:
-            dialogResult = fileDialog.showOpen()
-        else:
-            dialogResult = fileDialog.showSave()
-
-        if dialogResult == adsk.core.DialogResults.DialogOK:  # type: ignore
-            filename = fileDialog.filename
-        else:
-            return
-
-        # if isImport is true read the parameters from a file
-        if isImport:
-            export(filename, do_stl, do_step, do_obj, do_3mf)
-        else:
-            write_parameters_to_file(filename)
-
-    except:
-        if ui:
-            ui.messageBox("Failed:\n{}".format(traceback.format_exc()))
-
-
 def write_parameters_to_file(filePath: str):
     app = adsk.core.Application.get()
-    design: adsk.fusion.Design = app.activeProduct  # type: ignore
+    design = adsk.fusion.Design.cast(app.activeProduct)  # type: ignore
 
     with open(filePath, "w", newline="") as csvFile:
         csvWriter = csv.writer(csvFile, dialect=csv.excel)
@@ -313,29 +355,6 @@ def export_meshes(
         export_manager.execute(options)
 
 
-def export(filePath: str, do_stl: bool, do_step: bool, do_obj: bool, do_3mf: bool):
-    app = adsk.core.Application.get()
-    design: adsk.fusion.Design = app.activeProduct  # type: ignore
-    ui = app.userInterface
-    output_folder = get_output_folder()
-    if output_folder is None:
-        return
-    variations = read_parameters_from_file(filePath)
-    for variation in variations:
-        if variation.should_export:
-            apply_parameters(ui, design, variation)
-            export_meshes(
-                output_folder,
-                variation.output_filename,
-                design.activeComponent,
-                do_stl,
-                do_step,
-                do_obj,
-                do_3mf,
-            )
-    ui.messageBox("Export finished successfully")
-
-
 def apply_parameters(
     ui: adsk.core.UserInterface, design: adsk.fusion.Design, params: ParameterList
 ):
@@ -408,6 +427,52 @@ def update_parameter(
         return False
 
 
+def run(_):
+    ui = None
+
+    try:
+        app = adsk.core.Application.get()
+        ui = app.userInterface
+        bulk_export_command_definition = get_add_in_command_definition(
+            ui,
+            BULK_EXPORT_COMMAND_ID,
+            BULK_EXPORT_COMMAND_NAME,
+            BULK_EXPORT_COMMAND_DESCRIPTION,
+        )
+        bulk_export_command_created = BulkExportCommandCreatedHandler()
+        bulk_export_command_definition.commandCreated.add(bulk_export_command_created)
+        _handlers.append(bulk_export_command_created)
+
+        # variant_export_command_definition = get_add_in_command_definition(
+        #     ui,
+        #     VARIANT_EXPORT_COMMAND_ID,
+        #     "Export single Variant",
+        #     "Export a single variant with given parameters",
+        # )
+        # export_variant_command_created = ExportVariantCommandCreatedEventHandler()
+        # variant_export_command_definition.commandCreated.add(
+        #     export_variant_command_created
+        # )
+        # _handlers.append(export_variant_command_created)
+
+        workspaces = ui.workspaces
+        modeling_workspace = workspaces.itemById(TARGET_WORKSPACE)
+        toolbar_panels = modeling_workspace.toolbarPanels
+        toolbar_panel = toolbar_panels.itemById(TARGET_PANEL)
+        toolbar_controls_panel = toolbar_panel.controls
+        toolbar_control_panel = toolbar_controls_panel.itemById(BULK_EXPORT_COMMAND_ID)
+        if not toolbar_control_panel:
+            toolbar_control_panel = toolbar_controls_panel.addCommand(
+                bulk_export_command_definition, ""
+            )
+            toolbar_control_panel.isVisible = True
+            futil.log(f"{BULK_EXPORT_COMMAND_ID} successfully added to add ins panel")
+    except Exception:
+        if ui:
+            ui.messageBox("AddIn Start Failed:\n{}".format(traceback.format_exc()))
+        futil.handle_error("run")
+
+
 def stop(_):
     ui = None
     try:
@@ -415,11 +480,11 @@ def stop(_):
         ui = app.userInterface
         obj_array: list[adsk.core.ToolbarControl | adsk.core.CommandDefinition] = []
 
-        command_control_panel = command_control_by_id_for_panel(COMMAND_ID)
+        command_control_panel = command_control_by_id_for_panel(BULK_EXPORT_COMMAND_ID)
         if command_control_panel:
             obj_array.append(command_control_panel)
 
-        command_definition = command_definition_by_id(COMMAND_ID)
+        command_definition = command_definition_by_id(BULK_EXPORT_COMMAND_ID)
         if command_definition:
             obj_array.append(command_definition)
 
